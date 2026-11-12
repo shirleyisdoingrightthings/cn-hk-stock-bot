@@ -708,6 +708,18 @@ def run_send() -> int:
     sent_hk = send_feishu(sanitize_html(text_hk), FEISHU_WEBHOOK_HK)
     print(f"  ✓ 港股推送成功（{sent_hk} 条）", file=sys.stderr)
 
+    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
+    try:
+        from notion_archive import archive_to_notion
+        combined_cn_hk = f"## 📈 A股市场\n\n{text_cn}\n\n---\n\n## 🇭🇰 港股市场\n\n{text_hk}"
+        ok, res = archive_to_notion(combined_cn_hk, "📈 A股与港股")
+        if ok:
+            print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
+        else:
+            print(f"  [WARN] Notion 归档未完成: {res}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [WARN] Notion 归档调用失败: {e}", file=sys.stderr)
+
     # 若为收盘复盘（或包含收盘 snapshot），自动更新最近 5 个交易日跨日盘面状态记忆库
     try:
         meta = json.loads(FETCH_META.read_text(encoding="utf-8")) if FETCH_META.exists() else {}
