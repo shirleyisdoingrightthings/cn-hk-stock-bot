@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -498,8 +499,38 @@ def _format_sector_block(title: str, sec_list: list[dict[str, Any]], is_gainer: 
     return lines
 
 
+def _session_ran_today(log_file: Path, session_mode: str) -> bool:
+    """按场次判定今天是否已成功推送（避免 09:00 premarket 的 [OK] 误拦 16:15 close）。"""
+    if os.getenv("FORCE_RUN") == "1" or not log_file.exists():
+        return False
+    today_prefix = datetime.now().strftime("%Y-%m-%d")
+    tag = f"({session_mode})"
+    try:
+        for line in log_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith(today_prefix) and "[OK]" in line and tag in line:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def run_fetch(session_mode: str) -> int:
     now = datetime.now()
+    if session_mode == "premarket" and os.getenv("FORCE_RUN") != "1":
+        if now.hour > 10 or (now.hour == 10 and now.minute > 0):
+            print("=== SKIP_EXPIRED ===")
+            write_log("WARN", "已过 10:00 开盘前瞻窗口（premarket），自动跳过")
+            return 0
+
+    if _session_ran_today(LOG_FILE, session_mode):
+        print("=== SKIP_ALREADY_RAN ===")
+        return 0
+
+    if now.weekday() >= 5 and os.getenv("FORCE_RUN") != "1":
+        print("=== SKIP_NON_TRADING_DAY ===")
+        write_log("WARN", f"周末非交易日（{session_mode}），未出稿")
+        return 0
+
     today_str = f"{now.year}年{now.month}月{now.day}日"
     session_label = "开盘前瞻（09:00 盘前）" if session_mode == "premarket" else "收盘复盘（16:15 盘后）"
 
@@ -515,6 +546,19 @@ def run_fetch(session_mode: str) -> int:
     )
     print(f"📡 正在抓取 A股 / 港股动态板块排行 & 各板块 Top 3 个股（模式：{session_label}）...", file=sys.stderr)
     quotes = fetch_gtimg_quotes(all_codes)
+    if not quotes:
+        print("=== SKIP_NO_DATA ===")
+        write_log("FAIL", f"行情接口返回为空（{session_mode}）")
+        return 1
+
+    if session_mode == "close" and os.getenv("FORCE_RUN") != "1":
+        today_compact = now.strftime("%Y%m%d")
+        sh_date = re.sub(r"\D", "", quotes.get("sh000001", {}).get("time", ""))[:8]
+        hk_date = re.sub(r"\D", "", quotes.get("hkHSI", {}).get("time", ""))[:8]
+        if sh_date and hk_date and sh_date != today_compact and hk_date != today_compact:
+            print("=== SKIP_NON_TRADING_DAY ===")
+            write_log("WARN", f"沪深港今日均休市（A股最近 {sh_date} / 港股最近 {hk_date}），未出稿")
+            return 0
 
     # A股优先拉取新浪全市场行业实时涨跌 Top 3 + 行业内 Top 3 个股，同时提供 12 大主线板块池对比
     cn_sina_sectors = fetch_sina_cn_sectors_top3()
@@ -688,8 +732,18 @@ def run_fetch(session_mode: str) -> int:
     return 0
 
 
-def run_send() -> int:
+def run_send(session_override: str | None = None) -> int:
     t0 = time.time()
+    try:
+        meta = json.loads(FETCH_META.read_text(encoding="utf-8")) if FETCH_META.exists() else {}
+    except Exception:
+        meta = {}
+    sess_mode = session_override or meta.get("metrics", {}).get("session") or "close"
+
+    if _session_ran_today(LOG_FILE, sess_mode):
+        print(f"今天 {sess_mode} 场次已成功运行过，跳过发送。如需强制请设置 FORCE_RUN=1。", file=sys.stderr)
+        return 0
+
     if not DRAFT_CN.exists() or not DRAFT_HK.exists():
         write_log("FAIL", f"A股或港股稿件缺失（需同时存在 {DRAFT_CN.name} 与 {DRAFT_HK.name}）")
         return 1
@@ -700,19 +754,35 @@ def run_send() -> int:
         write_log("FAIL", "A股或港股稿件为空")
         return 1
 
+    clean_cn = sanitize_html(text_cn)
+    clean_hk = sanitize_html(text_hk)
+    save_pending([clean_cn, clean_hk])
+
     print("📨 正在推送《A股报告》至 A股飞书机器人...", file=sys.stderr)
-    sent_cn = send_feishu(sanitize_html(text_cn), FEISHU_WEBHOOK_CN)
+    sent_cn = send_feishu(clean_cn, FEISHU_WEBHOOK_CN)
     print(f"  ✓ A股推送成功（{sent_cn} 条）", file=sys.stderr)
+    save_pending([clean_hk])
 
     print("📨 正在推送《港股报告》至 港股飞书机器人...", file=sys.stderr)
-    sent_hk = send_feishu(sanitize_html(text_hk), FEISHU_WEBHOOK_HK)
+    sent_hk = send_feishu(clean_hk, FEISHU_WEBHOOK_HK)
     print(f"  ✓ 港股推送成功（{sent_hk} 条）", file=sys.stderr)
+    CACHE_FILE.unlink(missing_ok=True)
+
+    snap = meta.get("snapshot") or {}
+    rtype = "开盘前瞻" if sess_mode == "premarket" else "收盘复盘"
+    doc_date = datetime.now().strftime("%Y-%m-%d") if sess_mode == "premarket" else (snap.get("date") or datetime.now().strftime("%Y-%m-%d"))
 
     # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
     try:
         from notion_archive import archive_to_notion
-        combined_cn_hk = f"## 📈 A股市场\n\n{text_cn}\n\n---\n\n## 🇭🇰 港股市场\n\n{text_hk}"
-        ok, res = archive_to_notion(combined_cn_hk, "📈 A股与港股")
+        combined_cn_hk = f"## 📈 A股市场（{rtype}）\n\n{text_cn}\n\n---\n\n## 🇭🇰 港股市场（{rtype}）\n\n{text_hk}"
+        ok, res = archive_to_notion(
+            combined_cn_hk,
+            "📈 A股与港股",
+            date_str=doc_date,
+            report_type=rtype,
+            title_override=f"[A股与港股] {doc_date} {rtype}",
+        )
         if ok:
             print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
         else:
@@ -722,9 +792,6 @@ def run_send() -> int:
 
     # 若为收盘复盘（或包含收盘 snapshot），自动更新最近 5 个交易日跨日盘面状态记忆库
     try:
-        meta = json.loads(FETCH_META.read_text(encoding="utf-8")) if FETCH_META.exists() else {}
-        sess_mode = meta.get("metrics", {}).get("session", "close")
-        snap = meta.get("snapshot") or {}
         if sess_mode == "close" and snap.get("cn") and snap.get("hk"):
             cn_sig, cn_focus = _extract_signal_and_focus(text_cn)
             hk_sig, hk_focus = _extract_signal_and_focus(text_hk)
@@ -751,8 +818,8 @@ def run_send() -> int:
     duration = round(time.time() - t0, 1)
     write_log(
         "OK",
-        f"A股({len(text_cn)}字) + 港股({len(text_hk)}字) 飞书双机器人推送成功",
-        metrics={"duration_s": duration, "cn_chars": len(text_cn), "hk_chars": len(text_hk)},
+        f"A股({len(text_cn)}字) + 港股({len(text_hk)}字) 飞书双机器人推送成功 ({sess_mode})",
+        metrics={"session": sess_mode, "duration_s": duration, "cn_chars": len(text_cn), "hk_chars": len(text_hk)},
     )
     return 0
 
@@ -760,13 +827,18 @@ def run_send() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="A股 & 港股智能决策日报")
     parser.add_argument("--mode", choices=["fetch", "send"], required=True)
-    parser.add_argument("--session", choices=["premarket", "close"], default="close",
-                        help="premarket=09:00开盘前瞻，close=16:15收盘复盘")
+    parser.add_argument("--session", choices=["premarket", "close"], default=None,
+                        help="premarket=09:00开盘前瞻，close=16:15收盘复盘（send 未传时自动从 fetch_meta 读取）")
     args = parser.parse_args()
     if args.mode == "fetch":
-        return run_fetch(session_mode=args.session)
-    return run_send()
+        return run_fetch(session_mode=args.session or "close")
+    return run_send(session_override=args.session)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        err = traceback.format_exc().strip().splitlines()[-1]
+        write_log("FAIL", err)
+        raise
