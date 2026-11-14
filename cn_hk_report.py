@@ -28,6 +28,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (
+    archive_and_sync_notion,
     emit_fetch_output,
     make_logger,
     make_pending_saver,
@@ -772,23 +773,18 @@ def run_send(session_override: str | None = None) -> int:
     rtype = "开盘前瞻" if sess_mode == "premarket" else "收盘复盘"
     doc_date = datetime.now().strftime("%Y-%m-%d") if sess_mode == "premarket" else (snap.get("date") or datetime.now().strftime("%Y-%m-%d"))
 
-    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
-    try:
-        from notion_archive import archive_to_notion
-        combined_cn_hk = f"{text_cn}\n\n---\n\n{text_hk}"
-        ok, res = archive_to_notion(
-            combined_cn_hk,
-            "📈 A股与港股",
-            date_str=doc_date,
-            report_type=rtype,
-            title_override=f"[A股与港股] {doc_date} {rtype}",
-        )
-        if ok:
-            print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
-        else:
-            print(f"  [WARN] Notion 归档未完成: {res}", file=sys.stderr)
-    except Exception as e:
-        print(f"  [WARN] Notion 归档调用失败: {e}", file=sys.stderr)
+    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库，并按场次落盘本地归档
+    combined_cn_hk = f"{text_cn}\n\n---\n\n{text_hk}"
+    notion_meta = archive_and_sync_notion(
+        combined_cn_hk,
+        "📈 A股与港股",
+        date_str=doc_date,
+        archive_dir=DRAFT_CN.parent / "archive",
+        archive_filename=f"{doc_date}_{sess_mode}.txt",
+        report_type=rtype,
+        title_override=f"[A股与港股] {doc_date} {rtype}",
+    )
+    notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
 
     # 若为收盘复盘（或包含收盘 snapshot），自动更新最近 5 个交易日跨日盘面状态记忆库
     try:
@@ -818,8 +814,8 @@ def run_send(session_override: str | None = None) -> int:
     duration = round(time.time() - t0, 1)
     write_log(
         "OK",
-        f"A股({len(text_cn)}字) + 港股({len(text_hk)}字) 飞书双机器人推送成功 ({sess_mode})",
-        metrics={"session": sess_mode, "duration_s": duration, "cn_chars": len(text_cn), "hk_chars": len(text_hk)},
+        f"A股({len(text_cn)}字) + 港股({len(text_hk)}字) 飞书双机器人推送成功 ({sess_mode}){notion_tag}",
+        metrics={"session": sess_mode, **notion_meta, "duration_s": duration, "cn_chars": len(text_cn), "hk_chars": len(text_hk)},
     )
     return 0
 
