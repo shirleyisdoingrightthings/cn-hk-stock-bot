@@ -531,7 +531,7 @@ def run_fetch(session_mode: str) -> int:
         write_log("WARN", f"周末非交易日（{session_mode}），未出稿")
         return 0
 
-    today_str = f"{now.year}年{now.month}月{now.day}日"
+    today_str = now.strftime("%Y-%m-%d")
     session_label = "开盘前瞻（09:00 盘前）" if session_mode == "premarket" else "收盘复盘（16:15 盘后）"
 
     cn_pool_codes = [c for members in CN_SECTOR_POOL.values() for c, _ in members]
@@ -775,7 +775,7 @@ def run_send(session_override: str | None = None) -> int:
     # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
     try:
         from notion_archive import archive_to_notion
-        combined_cn_hk = f"## 📈 A股市场（{rtype}）\n\n{text_cn}\n\n---\n\n## 🇭🇰 港股市场（{rtype}）\n\n{text_hk}"
+        combined_cn_hk = f"{text_cn}\n\n---\n\n{text_hk}"
         ok, res = archive_to_notion(
             combined_cn_hk,
             "📈 A股与港股",
