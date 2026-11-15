@@ -782,7 +782,6 @@ def run_send(session_override: str | None = None) -> int:
         archive_dir=DRAFT_CN.parent / "archive",
         archive_filename=f"{doc_date}_{sess_mode}.txt",
         report_type=rtype,
-        title_override=f"[A股与港股] {doc_date} {rtype}",
     )
     notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
 
