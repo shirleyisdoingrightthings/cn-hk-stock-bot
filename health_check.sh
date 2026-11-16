@@ -6,6 +6,14 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_NAME="CN/HK Stock Bot"
 
 CATCHUP_FROM=9
+if [ -z "${SESSION_FILTER:-}" ]; then
+    HOUR_NOW=$(date '+%-H')
+    if [ "$HOUR_NOW" -ge 16 ]; then
+        SESSION_FILTER="close"
+    else
+        SESSION_FILTER="premarket"
+    fi
+fi
 NO_NEWS_PATTERN="休市|非交易日|自动跳过"
 NO_NEWS_MSG="今日休市或已过盘前窗口，未出稿（非故障）"
 

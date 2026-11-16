@@ -558,7 +558,7 @@ def run_fetch(session_mode: str) -> int:
         hk_date = re.sub(r"\D", "", quotes.get("hkHSI", {}).get("time", ""))[:8]
         if sh_date and hk_date and sh_date != today_compact and hk_date != today_compact:
             print("=== SKIP_NON_TRADING_DAY ===")
-            write_log("WARN", f"沪深港今日均休市（A股最近 {sh_date} / 港股最近 {hk_date}），未出稿")
+            write_log("WARN", f"沪深港今日均休市（{session_mode}；A股最近 {sh_date} / 港股最近 {hk_date}），未出稿")
             return 0
 
     # A股优先拉取新浪全市场行业实时涨跌 Top 3 + 行业内 Top 3 个股，同时提供 12 大主线板块池对比
@@ -746,13 +746,13 @@ def run_send(session_override: str | None = None) -> int:
         return 0
 
     if not DRAFT_CN.exists() or not DRAFT_HK.exists():
-        write_log("FAIL", f"A股或港股稿件缺失（需同时存在 {DRAFT_CN.name} 与 {DRAFT_HK.name}）")
+        write_log("FAIL", f"A股或港股稿件缺失（{sess_mode}；需同时存在 {DRAFT_CN.name} 与 {DRAFT_HK.name}）", metrics={"session": sess_mode})
         return 1
 
     text_cn = DRAFT_CN.read_text(encoding="utf-8").strip()
     text_hk = DRAFT_HK.read_text(encoding="utf-8").strip()
     if not text_cn or not text_hk:
-        write_log("FAIL", "A股或港股稿件为空")
+        write_log("FAIL", f"A股或港股稿件为空（{sess_mode}）", metrics={"session": sess_mode})
         return 1
 
     clean_cn = sanitize_html(text_cn)
