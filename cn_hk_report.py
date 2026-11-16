@@ -1,11 +1,12 @@
 #!/usr/bin/python3
 """
-A股 & 港股智能决策日报（开盘前瞻 09:00 + 收盘复盘 16:15）
+A股 & 港股智能决策日报（开盘前瞻 09:00 + 午间缺早补午 12:05 + 收盘复盘 16:15）
 借鉴 GitHub Trending 热门项目 ZhuLinsen/daily_stock_analysis 的「决策仪表盘 + 均线乖离率趋势诊断 + 市场宽度 + 舆情催化」框架，
 并升级为「动态捕捉当日领涨 Top 3 板块 & 领跌 Top 3 板块 + 各板块内领涨/领跌 Top 3 个股」，告别固定死名单。
 
 分别向「A股飞书机器人」与「港股飞书机器人」推送：
-- 周一至周五 09:00（--session premarket）：《🇨🇳 A股开盘前瞻》与《🇭🇰 港股开盘前瞻》
+- 周一至周五 09:00（--session premarket，09:00–10:00 有效，过 10:00 自动跳过）：《🇨🇳 A股开盘前瞻》与《🇭🇰 港股开盘前瞻》
+- 周一至周五 12:05（--session midday，12:00–13:00 有效，且仅在当天 premarket 未成功发送时触发）：《🇨🇳 A股早盘总结 & 午后前瞻》与《🇭🇰 港股早盘总结 & 午后前瞻》
 - 周一至周五 16:15（--session close）：《🇨🇳 A股收盘复盘》与《🇭🇰 港股收盘复盘》
 """
 
@@ -360,16 +361,22 @@ def compute_pool_sectors_top3(
     return {"gainers": gainers, "losers": losers}
 
 
-def fetch_ma_trend(code: str) -> str:
+def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "") -> str:
     """拉取最近 25 日 K 线，计算 MA5 / MA10 / MA20 与 MA5 乖离率，输出趋势状态。"""
     try:
         url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,25,qfq"
         resp = DIRECT_SESSION.get(url, headers={"User-Agent": _UA}, timeout=8)
         data = resp.json().get("data", {}).get(code, {})
         klines = data.get("day") or data.get("qfqday") or []
-        if len(klines) < 20:
+        if len(klines) < 19:
             return ""
         closes = [_safe_float(row[2]) for row in klines if len(row) >= 3]
+        last_bar_date = str(klines[-1][0])[:10] if klines and len(klines[-1]) >= 1 else ""
+        if live_last > 0 and today_str:
+            if last_bar_date == today_str:
+                closes[-1] = live_last
+            else:
+                closes.append(live_last)
         if len(closes) < 20 or not closes[-1]:
             return ""
         cur = closes[-1]
@@ -515,12 +522,33 @@ def _session_ran_today(log_file: Path, session_mode: str) -> bool:
     return False
 
 
+def _is_in_window(now: datetime, session_mode: str) -> tuple[bool, str]:
+    """校验场次时效窗口，返回 (是否放行, 跳过日志文案)。"""
+    if session_mode == "premarket":
+        if now.hour < 9:
+            return False, "未到 09:00 开盘前瞻窗口（premarket），自动跳过"
+        if now.hour > 10 or (now.hour == 10 and now.minute > 0):
+            return False, "已过 10:00 开盘前瞻窗口（premarket），自动跳过"
+    elif session_mode == "midday":
+        if now.hour < 12:
+            return False, "未到 12:00 午间窗口（midday），自动跳过"
+        if now.hour > 13 or (now.hour == 13 and now.minute > 0):
+            return False, "已过 13:00 午间窗口（midday），自动跳过"
+    return True, ""
+
+
 def run_fetch(session_mode: str) -> int:
     now = datetime.now()
-    if session_mode == "premarket" and os.getenv("FORCE_RUN") != "1":
-        if now.hour > 10 or (now.hour == 10 and now.minute > 0):
+    if os.getenv("FORCE_RUN") != "1":
+        in_win, skip_msg = _is_in_window(now, session_mode)
+        if not in_win:
             print("=== SKIP_EXPIRED ===")
-            write_log("WARN", "已过 10:00 开盘前瞻窗口（premarket），自动跳过")
+            write_log("WARN", skip_msg)
+            return 0
+
+        if session_mode == "midday" and _session_ran_today(LOG_FILE, "premarket"):
+            print("=== SKIP_PREMARKET_ALREADY_RAN ===")
+            write_log("WARN", "今日已正常推送开盘前瞻（premarket），午间场（midday）自动跳过不重复打扰")
             return 0
 
     if _session_ran_today(LOG_FILE, session_mode):
@@ -533,7 +561,11 @@ def run_fetch(session_mode: str) -> int:
         return 0
 
     today_str = now.strftime("%Y-%m-%d")
-    session_label = "开盘前瞻（09:00 盘前）" if session_mode == "premarket" else "收盘复盘（16:15 盘后）"
+    session_label = {
+        "premarket": "开盘前瞻（09:00 盘前）",
+        "midday": "早盘收盘总结 & 午后前瞻（12:05 午休）",
+        "close": "收盘复盘（16:15 盘后）",
+    }.get(session_mode, "收盘复盘（16:15 盘后）")
 
     cn_pool_codes = [c for members in CN_SECTOR_POOL.values() for c, _ in members]
     hk_pool_codes = [c for members in HK_SECTOR_POOL.values() for c, _ in members]
@@ -552,10 +584,10 @@ def run_fetch(session_mode: str) -> int:
         write_log("FAIL", f"行情接口返回为空（{session_mode}）")
         return 1
 
-    if session_mode == "close" and os.getenv("FORCE_RUN") != "1":
-        today_compact = now.strftime("%Y%m%d")
-        sh_date = re.sub(r"\D", "", quotes.get("sh000001", {}).get("time", ""))[:8]
-        hk_date = re.sub(r"\D", "", quotes.get("hkHSI", {}).get("time", ""))[:8]
+    today_compact = now.strftime("%Y%m%d")
+    sh_date = re.sub(r"\D", "", quotes.get("sh000001", {}).get("time", ""))[:8]
+    hk_date = re.sub(r"\D", "", quotes.get("hkHSI", {}).get("time", ""))[:8]
+    if session_mode in ("midday", "close") and os.getenv("FORCE_RUN") != "1":
         if sh_date and hk_date and sh_date != today_compact and hk_date != today_compact:
             print("=== SKIP_NON_TRADING_DAY ===")
             write_log("WARN", f"沪深港今日均休市（{session_mode}；A股最近 {sh_date} / 港股最近 {hk_date}），未出稿")
@@ -569,7 +601,10 @@ def run_fetch(session_mode: str) -> int:
     ma_targets = [c for c, _ in CN_INDICES] + [c for c, _ in HK_INDICES]
     ma_map: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {c: pool.submit(fetch_ma_trend, c) for c in ma_targets}
+        futs = {
+            c: pool.submit(fetch_ma_trend, c, quotes.get(c, {}).get("last", 0.0), today_str)
+            for c in ma_targets
+        }
         for c, fut in futs.items():
             ma_map[c] = fut.result()
 
@@ -604,6 +639,11 @@ def run_fetch(session_mode: str) -> int:
         f"今天日期：{today_str}",
         f"场次模式：{session_label}（{session_mode}）",
     ]
+    if session_mode in ("midday", "close"):
+        if sh_date and sh_date != today_compact:
+            out.append(f"⚠️ 单边休市提示：A股今日休市（最近交易日 {sh_date}），请勿将前日数据误报为今日早盘/收盘表现")
+        if hk_date and hk_date != today_compact:
+            out.append(f"⚠️ 单边休市提示：港股今日休市（最近交易日 {hk_date}），请勿将前日数据误报为今日早盘/收盘表现")
     mem = _load_market_memory()
     out.extend(_format_memory_block(mem))
     out.extend([
@@ -617,12 +657,35 @@ def run_fetch(session_mode: str) -> int:
         if q:
             out.append(f"- {label} ({code})：{q['last']} ({q['pct_str']})")
 
+    if session_mode == "midday":
+        prev_cn = (mem.get("cn") or [{}])[-1]
+        prev_turnover_hint = (
+            f" | 前一交易日({prev_cn.get('date', '?')})全天成交：{prev_cn.get('turnover', '未知')}"
+            if prev_cn.get("turnover")
+            else ""
+        )
+        amt_line = f"- 沪深两市早盘半日合计成交额：{cn_total_amt:,.1f} 亿元（上证 {sh_amt:,.1f} 亿 + 深证 {sz_amt:,.1f} 亿{prev_turnover_hint}）"
+        cn_sec_heading = "【三、🇨🇳 A股早盘涨幅 Top 3 板块 & 跌幅 Top 3 板块（含各板块内 Top 3 个股）】"
+        cn_sina_up = "🔥 A股早盘全市场领涨 Top 3 行业板块（新浪实时行业榜）："
+        cn_sina_dn = "❄️ A股早盘全市场领跌 Top 3 行业板块（新浪实时行业榜）："
+        hk_sec_heading = "【五、🇭🇰 港股早盘涨幅 Top 3 板块 & 跌幅 Top 3 板块（含各板块内 Top 3 个股）】"
+        hk_up_title = "🔥 港股早盘领涨 Top 3 板块（及板块内涨幅 Top 3 个股）："
+        hk_dn_title = "❄️ 港股早盘领跌 Top 3 板块（及板块内跌幅 Top 3 个股）："
+    else:
+        amt_line = f"- 沪深两市合计成交额：{cn_total_amt:,.1f} 亿元（上证 {sh_amt:,.1f} 亿 + 深证 {sz_amt:,.1f} 亿）"
+        cn_sec_heading = "【三、🇨🇳 A股今日涨幅 Top 3 板块 & 跌幅 Top 3 板块（含各板块内 Top 3 个股）】"
+        cn_sina_up = "🔥 A股全市场领涨 Top 3 行业板块（新浪实时行业榜）："
+        cn_sina_dn = "❄️ A股全市场领跌 Top 3 行业板块（新浪实时行业榜）："
+        hk_sec_heading = "【五、🇭🇰 港股今日涨幅 Top 3 板块 & 跌幅 Top 3 板块（含各板块内 Top 3 个股）】"
+        hk_up_title = "🔥 港股今日领涨 Top 3 板块（及板块内涨幅 Top 3 个股）："
+        hk_dn_title = "❄️ 港股今日领跌 Top 3 板块（及板块内跌幅 Top 3 个股）："
+
     out.extend([
         "",
         "==========================================",
         "【二、🇨🇳 A股核心指数、市场宽度与技术面诊断（含 MA5/MA20 乖离率）】",
         "==========================================",
-        f"- 沪深两市合计成交额：{cn_total_amt:,.1f} 亿元（上证 {sh_amt:,.1f} 亿 + 深证 {sz_amt:,.1f} 亿）",
+        amt_line,
         f"- A股市场宽度：12大核心主线板块 {cn_sec_up} 涨 {cn_sec_down} 跌 | 72只行业龙头样本股 {cn_stk_up} 涨 {cn_stk_down} 跌",
     ])
     for code, label in CN_INDICES:
@@ -637,12 +700,12 @@ def run_fetch(session_mode: str) -> int:
     out.extend([
         "",
         "==========================================",
-        "【三、🇨🇳 A股今日涨幅 Top 3 板块 & 跌幅 Top 3 板块（含各板块内 Top 3 个股）】",
+        cn_sec_heading,
         "==========================================",
     ])
     if cn_sina_sectors:
-        out.extend(_format_sector_block("🔥 A股全市场领涨 Top 3 行业板块（新浪实时行业榜）：", cn_sina_sectors["gainers"], is_gainer=True, is_hk=False))
-        out.extend(_format_sector_block("❄️ A股全市场领跌 Top 3 行业板块（新浪实时行业榜）：", cn_sina_sectors["losers"], is_gainer=False, is_hk=False))
+        out.extend(_format_sector_block(cn_sina_up, cn_sina_sectors["gainers"], is_gainer=True, is_hk=False))
+        out.extend(_format_sector_block(cn_sina_dn, cn_sina_sectors["losers"], is_gainer=False, is_hk=False))
     out.extend(_format_sector_block("🧭 A股核心主线赛道涨幅 Top 3（及赛道内领涨 Top 3 龙头）：", cn_pool_sectors["gainers"], is_gainer=True, is_hk=False))
     out.extend(_format_sector_block("🧭 A股核心主线赛道跌幅 Top 3（及赛道内领跌 Top 3 龙头）：", cn_pool_sectors["losers"], is_gainer=False, is_hk=False))
 
@@ -665,11 +728,11 @@ def run_fetch(session_mode: str) -> int:
     out.extend([
         "",
         "==========================================",
-        "【五、🇭🇰 港股今日涨幅 Top 3 板块 & 跌幅 Top 3 板块（含各板块内 Top 3 个股）】",
+        hk_sec_heading,
         "==========================================",
     ])
-    out.extend(_format_sector_block("🔥 港股今日领涨 Top 3 板块（及板块内涨幅 Top 3 个股）：", hk_pool_sectors["gainers"], is_gainer=True, is_hk=True))
-    out.extend(_format_sector_block("❄️ 港股今日领跌 Top 3 板块（及板块内跌幅 Top 3 个股）：", hk_pool_sectors["losers"], is_gainer=False, is_hk=True))
+    out.extend(_format_sector_block(hk_up_title, hk_pool_sectors["gainers"], is_gainer=True, is_hk=True))
+    out.extend(_format_sector_block(hk_dn_title, hk_pool_sectors["losers"], is_gainer=False, is_hk=True))
 
     out.extend([
         "",
@@ -770,7 +833,7 @@ def run_send(session_override: str | None = None) -> int:
     CACHE_FILE.unlink(missing_ok=True)
 
     snap = meta.get("snapshot") or {}
-    rtype = "开盘前瞻" if sess_mode == "premarket" else "收盘复盘"
+    rtype = {"premarket": "开盘前瞻", "midday": "午间复盘", "close": "收盘复盘"}.get(sess_mode, "收盘复盘")
     doc_date = datetime.now().strftime("%Y-%m-%d") if sess_mode == "premarket" else (snap.get("date") or datetime.now().strftime("%Y-%m-%d"))
 
     # 自动同步归档到 Notion「每日情报归档与决策看板」数据库，并按场次落盘本地归档
@@ -822,8 +885,8 @@ def run_send(session_override: str | None = None) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="A股 & 港股智能决策日报")
     parser.add_argument("--mode", choices=["fetch", "send"], required=True)
-    parser.add_argument("--session", choices=["premarket", "close"], default=None,
-                        help="premarket=09:00开盘前瞻，close=16:15收盘复盘（send 未传时自动从 fetch_meta 读取）")
+    parser.add_argument("--session", choices=["premarket", "midday", "close"], default=None,
+                        help="premarket=09:00开盘前瞻，midday=12:05午间缺早补午，close=16:15收盘复盘（send 未传时自动从 fetch_meta 读取）")
     args = parser.parse_args()
     if args.mode == "fetch":
         return run_fetch(session_mode=args.session or "close")

@@ -15,7 +15,7 @@ if [ -z "${SESSION_FILTER:-}" ]; then
     fi
 fi
 NO_NEWS_PATTERN="休市|非交易日|自动跳过"
-NO_NEWS_MSG="今日休市或已过盘前窗口，未出稿（非故障）"
+NO_NEWS_MSG="今日休市、已过时效窗口或早盘已推送，未出稿（非故障）"
 
 content_check() {
     local qcnt

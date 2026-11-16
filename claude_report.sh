@@ -3,7 +3,7 @@
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST="$HOME/Library/LaunchAgents/com.shirley.cn-hk-stock-bot.plist"
 SCRIPT="cn_hk_report.py"
-USAGE_MSG="用法: claude_report.sh {fetch [premarket|close] | send [premarket|close]}"
+USAGE_MSG="用法: claude_report.sh {fetch [premarket|midday|close] | send [premarket|midday|close]}"
 EXTRA_ARGS=()
 if [ "${1:-}" = "fetch" ]; then
     EXTRA_ARGS=(--session "${2:-close}")
