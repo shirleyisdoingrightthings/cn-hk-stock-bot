@@ -21,7 +21,7 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (
     archive_and_sync_notion,
     emit_fetch_output,
+    exa_agent_verify_catalysts,
+    exa_enrich_enabled,
+    exa_search_fallback,
+    format_exa_catalyst_block,
     make_logger,
     make_pending_saver,
     sanitize_html,
@@ -397,11 +401,34 @@ def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "") -> st
         return ""
 
 
-def fetch_sina_telegraph(limit: int = 25) -> list[str]:
-    """抓取新浪财经 7x24 小时滚动电报（A股焦点 tag_id=10 + 公司/行业 tag_id=4 + 宏观全局 tag_id=0），免 Key 直连。"""
-    items: list[str] = []
+def _parse_sina_ctime(ctime: str) -> datetime | None:
+    s = (ctime or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s[:19], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def fetch_sina_telegraph(
+    limit: int = 30,
+    max_age_hours: int | None = None,
+    now_dt: datetime | None = None,
+) -> list[str]:
+    """抓取新浪财经 7x24 小时滚动电报（A股焦点 tag_id=10 + 公司/行业 tag_id=4 + 宏观全局 tag_id=0），免 Key 直连。
+
+    修复历史截断 Bug：
+    - 过滤超出时效窗口的陈旧条目（工作日默认 36h，周一上午放宽至 78h 以保留周五收评），避免慢更新的 tag_id=10 拉回一周前旧收评占满名额；
+    - 跨 tag 去重后按发布时间严格倒序排列再取前 limit 条，确保最新 LPR/宏观与公司突发快讯不被挤掉。"""
+    ref_now = now_dt or datetime.now()
+    if max_age_hours is None:
+        max_age_hours = 78 if (ref_now.weekday() == 0 and ref_now.hour < 12) else 36
+    cutoff = ref_now - timedelta(hours=max_age_hours)
+
+    collected: list[tuple[datetime, str, str]] = []
     seen: set[str] = set()
-    for tag_id, tag_label, pg_size in [(10, "A股/港股市场", 15), (4, "公司/行业", 12), (0, "宏观/外围", 12)]:
+    for tag_id, tag_label, pg_size in [(10, "A股/港股市场", 15), (4, "公司/行业", 18), (0, "宏观/外围", 22)]:
         url = (
             "https://zhibo.sina.com.cn/api/zhibo/feed"
             f"?page=1&page_size={pg_size}&zhibo_id=152&tag_id={tag_id}&dire=f&dpc=1"
@@ -420,14 +447,185 @@ def fetch_sina_telegraph(limit: int = 25) -> list[str]:
                 rich = row.get("rich_text") or ""
                 txt = re.sub(r"<[^>]+>", "", html.unescape(rich)).strip()
                 txt = re.sub(r"\s+", " ", txt)
-                ctime = row.get("create_time") or ""
+                ctime = (row.get("create_time") or "").strip()
+                dt = _parse_sina_ctime(ctime)
+                if dt is not None and dt < cutoff:
+                    continue
                 key = txt[:40]
                 if len(txt) >= 20 and key not in seen:
                     seen.add(key)
-                    items.append(f"[{ctime} · {tag_label}] {txt[:260]}")
+                    sort_dt = dt or datetime.min
+                    collected.append((sort_dt, ctime, f"[{ctime} · {tag_label}] {txt[:260]}"))
         except Exception as exc:
             print(f"[WARN] 新浪 7x24 电报(tag={tag_id})抓取异常: {exc}", file=sys.stderr)
-    return items[:limit]
+
+    collected.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [line for _, _, line in collected[:limit]]
+
+
+_ADR_DUAL_CANONICAL = {
+    "usBABA": ("BABA / 09988.HK", "阿里巴巴"),
+    "hk09988": ("BABA / 09988.HK", "阿里巴巴"),
+    "usJD": ("JD / 09618.HK", "京东集团"),
+    "hk09618": ("JD / 09618.HK", "京东集团"),
+    "usNTES": ("NTES / 09999.HK", "网易"),
+    "hk09999": ("NTES / 09999.HK", "网易"),
+    "usBIDU": ("BIDU / 09888.HK", "百度集团"),
+    "hk09888": ("BIDU / 09888.HK", "百度集团"),
+    "usLI": ("LI / 02015.HK", "理想汽车"),
+    "hk02015": ("LI / 02015.HK", "理想汽车"),
+    "usXPEV": ("XPEV / 09868.HK", "小鹏汽车"),
+    "hk09868": ("XPEV / 09868.HK", "小鹏汽车"),
+    "usTCOM": ("TCOM / 09961.HK", "携程集团"),
+    "hk09961": ("TCOM / 09961.HK", "携程集团"),
+    "usPDD": ("PDD", "拼多多"),
+    "usFUTU": ("FUTU", "富途控股"),
+}
+
+_CN_ADR_CODES = ("usBABA", "usPDD", "usJD", "usNTES", "usBIDU", "usLI", "usXPEV", "usFUTU", "usTCOM")
+
+
+def _clean_cn_name(name: str) -> str:
+    s = re.sub(r"\([^)]*\)", "", name or "")
+    s = re.sub(r"(-SW|-W|-S|ADR|股份|集团|控股|有限|公司)$", "", s.strip())
+    return s.strip()
+
+
+def _format_std_symbol(code: str) -> str:
+    if code in _ADR_DUAL_CANONICAL:
+        return _ADR_DUAL_CANONICAL[code][0]
+    if code.startswith("hk"):
+        return f"{code[2:]}.HK"
+    if code.startswith("sh"):
+        return f"{code[2:]}.SH"
+    if code.startswith("sz"):
+        return f"{code[2:]}.SZ"
+    if code.startswith("us"):
+        return code[2:]
+    return code
+
+
+def _select_uncovered_cn_hk_movers(
+    session_mode: str,
+    quotes: dict[str, dict[str, Any]],
+    cn_pool_sectors: dict[str, list[dict[str, Any]]],
+    hk_pool_sectors: dict[str, list[dict[str, Any]]],
+    telegraph: list[str],
+    max_total: int = 6,
+) -> list[dict[str, Any]]:
+    """筛出新浪电报未提及、但涨跌幅显著的 A股/港股/中概异动龙头，合并两地上市标的并去重。"""
+    blob = "\n".join(telegraph)
+    raw_candidates: list[tuple[str, float, dict[str, Any]]] = []
+
+    def _is_covered(name: str, sym: str) -> bool:
+        core = _clean_cn_name(name)
+        if core and len(core) >= 2 and core in blob:
+            return True
+        if sym and len(sym) >= 4 and sym.split()[0] in blob:
+            return True
+        return False
+
+    def _add(bucket: str, code: str, name: str, pct: float, sector: str) -> None:
+        std_sym = _format_std_symbol(code)
+        canon_name = _ADR_DUAL_CANONICAL[code][1] if code in _ADR_DUAL_CANONICAL else name
+        if _is_covered(canon_name, std_sym):
+            return
+        raw_candidates.append((
+            bucket,
+            abs(pct),
+            {
+                "symbol": std_sym,
+                "name": canon_name,
+                "pct_change": f"{pct:+.2f}%",
+                "sector": sector,
+            },
+        ))
+
+    if session_mode == "premarket":
+        for code, label in US_MAPPING:
+            if code not in _CN_ADR_CODES:
+                continue
+            q = quotes.get(code)
+            if q and abs(q.get("pct", 0.0)) >= 3.5:
+                _add("hk_adr", code, label, q["pct"], "隔夜中概ADR")
+        for sec in hk_pool_sectors.get("gainers", []) + hk_pool_sectors.get("losers", []):
+            for st in sec.get("stocks", []):
+                if abs(st.get("pct", 0.0)) >= 4.0:
+                    _add("hk_adr", st["code"], st["name"], st["pct"], f"港股·{sec['name']}")
+        for sec in cn_pool_sectors.get("gainers", []) + cn_pool_sectors.get("losers", []):
+            for st in sec.get("stocks", []):
+                if abs(st.get("pct", 0.0)) >= 4.0:
+                    _add("cn", st["code"], st["name"], st["pct"], f"A股·{sec['name']}")
+    else:
+        for sec in cn_pool_sectors.get("gainers", []) + cn_pool_sectors.get("losers", []):
+            for st in sec.get("stocks", []):
+                if abs(st.get("pct", 0.0)) >= 3.0:
+                    _add("cn", st["code"], st["name"], st["pct"], f"A股·{sec['name']}")
+        for sec in hk_pool_sectors.get("gainers", []) + hk_pool_sectors.get("losers", []):
+            for st in sec.get("stocks", []):
+                if abs(st.get("pct", 0.0)) >= 3.0:
+                    _add("hk_adr", st["code"], st["name"], st["pct"], f"港股·{sec['name']}")
+
+    # 按 canonical symbol 去重，保留涨跌幅绝对值更大的一条（如网易 ADR -11.39% 与网易-S -14.39% 合并为 1 个名额）
+    by_sym: dict[str, tuple[str, float, dict[str, Any]]] = {}
+    for bucket, mag, row in raw_candidates:
+        key = row["symbol"]
+        if key not in by_sym or mag > by_sym[key][1]:
+            by_sym[key] = (bucket, mag, row)
+
+    cn_rows = sorted([v for v in by_sym.values() if v[0] == "cn"], key=lambda x: -x[1])
+    hk_rows = sorted([v for v in by_sym.values() if v[0] == "hk_adr"], key=lambda x: -x[1])
+
+    picked: list[dict[str, Any]] = []
+    if session_mode == "premarket":
+        # 盘前优先保障中概/港股大异动（最多 4 只）与 A 股竞价极端异动（至少 2 只）
+        picked.extend(r[2] for r in hk_rows[:4])
+        picked.extend(r[2] for r in cn_rows[: max(2, max_total - len(picked))])
+        if len(picked) < max_total:
+            rest = [r[2] for r in hk_rows[4:] + cn_rows[max(2, max_total - len(hk_rows[:4])) :]]
+            picked.extend(rest[: max_total - len(picked)])
+    else:
+        # 午盘/收盘：A 股最多 3 只 + 港股最多 3 只，单边不足则由另一边递补
+        picked.extend(r[2] for r in cn_rows[:3])
+        picked.extend(r[2] for r in hk_rows[:3])
+        if len(picked) < max_total:
+            extras = sorted(cn_rows[3:] + hk_rows[3:], key=lambda x: -x[1])
+            picked.extend(r[2] for r in extras[: max_total - len(picked)])
+
+    return picked[:max_total]
+
+
+def enrich_cn_hk_macro_events(telegraph: list[str], today_str: str, session_mode: str) -> list[str]:
+    """当电报出现重要日程提醒（如中国 LPR / 恒指季检）但未公布实际结果时，用轻量 Exa /search 补全。"""
+    blob = "\n".join(telegraph)
+    lines: list[str] = []
+
+    lpr_scheduled = ("LPR" in blob or "贷款市场报价利率" in blob)
+    lpr_reported = bool(re.search(r"(?:1年期|一年期|5年期|五年期)LPR.{0,12}(?:为|报|维持|下调|上调)\s*\d+\.\d+%", blob))
+    if lpr_scheduled and not lpr_reported:
+        hits = exa_search_fallback(
+            f"China LPR loan prime rate decision {today_str} 1-year 5-year PBOC 中国LPR报价",
+            num_results=2,
+            max_chars=700,
+            start_published_date=today_str,
+        )
+        for h in hits:
+            if h.get("text"):
+                lines.append(f"· [中国LPR结果补全] {h['title']}：{h['text'][:350]} ({h['url']})")
+
+    hsi_review = ("恒指公司" in blob or "恒生指数" in blob and "检讨" in blob)
+    if session_mode == "close" and hsi_review and "纳入" not in blob and "剔除" not in blob:
+        hits = exa_search_fallback(
+            f"Hang Seng Indexes quarterly review results {today_str} 恒生指数季检结果 纳入 剔除",
+            num_results=2,
+            max_chars=700,
+            start_published_date=today_str,
+        )
+        for h in hits:
+            if h.get("text"):
+                lines.append(f"· [恒指季检补全] {h['title']}：{h['text'][:350]} ({h['url']})")
+
+    return lines
 
 
 def _load_market_memory() -> dict[str, list[dict[str, Any]]]:
@@ -608,7 +806,31 @@ def run_fetch(session_mode: str) -> int:
         for c, fut in futs.items():
             ma_map[c] = fut.result()
 
-    telegraph = fetch_sina_telegraph(limit=25)
+    telegraph = fetch_sina_telegraph(limit=30)
+
+    exa_catalyst_block = ""
+    exa_macro_lines: list[str] = []
+    if exa_enrich_enabled(default_enabled=True):
+        uncovered = _select_uncovered_cn_hk_movers(
+            session_mode, quotes, cn_pool_sectors, hk_pool_sectors, telegraph, max_total=6
+        )
+        if uncovered:
+            print(
+                f"🔍 触发 Exa Agent 异动股定向催化补盲（{len(uncovered)} 只未命中电报）："
+                + "、".join(f"{u['name']}({u['pct_change']})" for u in uncovered),
+                file=sys.stderr,
+            )
+            confirmed = exa_agent_verify_catalysts(
+                uncovered,
+                market_label="A股与港股/中概股",
+                session_date=today_str,
+                max_entities=6,
+            )
+            exa_catalyst_block = format_exa_catalyst_block(
+                confirmed,
+                title="【七、🔍 Exa Agent 异动个股定向催化核查（仅保留经交叉验证的真实催化）】",
+            )
+        exa_macro_lines = enrich_cn_hk_macro_events(telegraph, today_str, session_mode)
 
     sh_amt = quotes.get("sh000001", {}).get("amount_yi", 0.0)
     sz_amt = quotes.get("sz399001", {}).get("amount_yi", 0.0)
@@ -742,6 +964,23 @@ def run_fetch(session_mode: str) -> int:
     ])
     for t in telegraph:
         out.append(f"· {t}")
+
+    if exa_catalyst_block:
+        out.extend([
+            "",
+            "==========================================",
+            exa_catalyst_block,
+            "==========================================",
+        ])
+
+    if exa_macro_lines:
+        out.extend([
+            "",
+            "==========================================",
+            f"【八、📡 Exa 轻量检索补充（当日重要宏观/日程结果，共 {len(exa_macro_lines)} 条）】",
+            "==========================================",
+        ])
+        out.extend(exa_macro_lines)
 
     out.append("=== CONTEXT_END ===")
 
