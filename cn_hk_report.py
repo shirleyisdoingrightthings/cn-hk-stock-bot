@@ -411,24 +411,63 @@ def _parse_sina_ctime(ctime: str) -> datetime | None:
     return None
 
 
+_SINA_NOISE_RE = re.compile(
+    r"(?:"
+    r"(?:控股股东|股东|实控人).{0,24}(?:解除)?质押|"
+    r"(?:部分)?(?:股份|股权|股票)(?:解除)?质押|"
+    r"质押\d+(?:\.\d+)?万股|"
+    r"聘任.{1,8}为(?:公司)?(?:总经理|副总经理|董事会秘书|董秘|财务总监|证券事务代表)|"
+    r"辞去(?:公司)?(?:董事|独立董事|监事|副总经理|财务总监|董秘)|"
+    r"证监局：对.{2,30}(?:资本管理|私募|投资管理|资产管理).{0,12}出具警示函|"
+    r"有投资者向.{1,25}提问.{0,120}(?:暂不涉及|没有回购计划|影响有限|尚存在不确定性|请关注公司公告)|"
+    r"向.{1,16}(?:增资|提供(?:履约)?担保)"
+    r")"
+)
+
+_SINA_HIGH_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"A股收评|港股收盘|午评|早评|LPR|贷款市场报价利率|中国人民银行|央行|美联储|日本央行|"
+    r"CPI|PPI|PMI|GDP|非农|社融|降准|降息|商务部|统计局|财政部|证监会|国资委|"
+    r"恒指公司|恒生指数.{0,10}检讨|纳入|剔除|黄金|原油|美债|离岸人民币|"
+    r"大摩|摩根士丹利|高盛|瑞银|汇丰|巴克莱|摩根大通|花旗|美银|财报|季报|年报|业绩|目标价|评级"
+    r")"
+)
+
+_MARKET_RECAP_LINE_RE = re.compile(r"【(?:港股收盘|A股收评|午评|港股午评)[：:]")
+
+
+def _tracked_core_names() -> tuple[str, ...]:
+    names: list[str] = []
+    for pool in (CN_SECTOR_POOL, HK_SECTOR_POOL):
+        for members in pool.values():
+            for _, nm in members:
+                core = _clean_cn_name(nm)
+                if len(core) >= 2 and core not in names:
+                    names.append(core)
+    return tuple(names)
+
+
 def fetch_sina_telegraph(
-    limit: int = 30,
+    limit: int = 38,
     max_age_hours: int | None = None,
     now_dt: datetime | None = None,
 ) -> list[str]:
     """抓取新浪财经 7x24 小时滚动电报（A股焦点 tag_id=10 + 公司/行业 tag_id=4 + 宏观全局 tag_id=0），免 Key 直连。
 
-    修复历史截断 Bug：
-    - 过滤超出时效窗口的陈旧条目（工作日默认 36h，周一上午放宽至 78h 以保留周五收评），避免慢更新的 tag_id=10 拉回一周前旧收评占满名额；
-    - 跨 tag 去重后按发布时间严格倒序排列再取前 limit 条，确保最新 LPR/宏观与公司突发快讯不被挤掉。"""
+    过滤与保活策略：
+    - 过滤超出时效窗口的陈旧条目（工作日默认 36h，周一上午放宽至 78h 以保留周五收评）；
+    - 滤除非核心池小公司的股权质押、常规高管聘任、无实质互动易问答与私募警示函等盘后刷屏噪音；
+    - 优先保活当日高信号条目（收评/午评/LPR/CPI/央行/大行评级/财报，最多预留 16 个名额），防止 16:10 盘后公告潮把上午重磅消息挤出窗口；
+    - 最终按发布时间严格倒序输出前 limit 条。"""
     ref_now = now_dt or datetime.now()
     if max_age_hours is None:
         max_age_hours = 78 if (ref_now.weekday() == 0 and ref_now.hour < 12) else 36
     cutoff = ref_now - timedelta(hours=max_age_hours)
+    core_names = _tracked_core_names()
 
-    collected: list[tuple[datetime, str, str]] = []
+    collected: list[tuple[datetime, str, bool, str]] = []
     seen: set[str] = set()
-    for tag_id, tag_label, pg_size in [(10, "A股/港股市场", 15), (4, "公司/行业", 18), (0, "宏观/外围", 22)]:
+    for tag_id, tag_label, pg_size in [(10, "A股/港股市场", 25), (4, "公司/行业", 30), (0, "宏观/外围", 35)]:
         url = (
             "https://zhibo.sina.com.cn/api/zhibo/feed"
             f"?page=1&page_size={pg_size}&zhibo_id=152&tag_id={tag_id}&dire=f&dpc=1"
@@ -451,16 +490,33 @@ def fetch_sina_telegraph(
                 dt = _parse_sina_ctime(ctime)
                 if dt is not None and dt < cutoff:
                     continue
+                if len(txt) < 20:
+                    continue
+                # 盘后刷屏噪音过滤：命中核心标的池或高信号关键词则放行，其余琐碎质押/人事/互动易直接过滤
+                if _SINA_NOISE_RE.search(txt) and not any(nm in txt for nm in core_names):
+                    continue
                 key = txt[:40]
-                if len(txt) >= 20 and key not in seen:
+                if key not in seen:
                     seen.add(key)
                     sort_dt = dt or datetime.min
-                    collected.append((sort_dt, ctime, f"[{ctime} · {tag_label}] {txt[:260]}"))
+                    is_high = bool(_SINA_HIGH_SIGNAL_RE.search(txt) or any(nm in txt for nm in core_names))
+                    collected.append((sort_dt, ctime, is_high, f"[{ctime} · {tag_label}] {txt[:260]}"))
         except Exception as exc:
             print(f"[WARN] 新浪 7x24 电报(tag={tag_id})抓取异常: {exc}", file=sys.stderr)
 
     collected.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return [line for _, _, line in collected[:limit]]
+    if len(collected) <= limit:
+        return [line for _, _, _, line in collected]
+
+    # 先保活最多 16 条高信号条目（确保上午 LPR/大行研报/午评不被 16:15 公告潮挤掉），再用其余最新条目填满 limit
+    high_quota = min(16, limit)
+    picked_high = [item for item in collected if item[2]][:high_quota]
+    picked_set = {item[3] for item in picked_high}
+    rest_slots = limit - len(picked_high)
+    picked_rest = [item for item in collected if item[3] not in picked_set][:rest_slots]
+    final_items = picked_high + picked_rest
+    final_items.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [line for _, _, _, line in final_items]
 
 
 _ADR_DUAL_CANONICAL = {
@@ -513,8 +569,12 @@ def _select_uncovered_cn_hk_movers(
     telegraph: list[str],
     max_total: int = 6,
 ) -> list[dict[str, Any]]:
-    """筛出新浪电报未提及、但涨跌幅显著的 A股/港股/中概异动龙头，合并两地上市标的并去重。"""
-    blob = "\n".join(telegraph)
+    """筛出新浪电报未提及、但涨跌幅显著的 A股/港股/中概异动龙头，合并两地上市标的并去重。
+
+    排除纯报价罗列型收评/午评（如“网易跌17.60%”），避免误判为“已有催化解释”；
+    名额优先向港股/中概股倾斜（Exa Financial Markets 对英文财报/SEC 6-K/港交所/大行评级命中率远高于纯 A 股）。"""
+    substantive_lines = [t for t in telegraph if not _MARKET_RECAP_LINE_RE.search(t)]
+    blob = "\n".join(substantive_lines)
     raw_candidates: list[tuple[str, float, dict[str, Any]]] = []
 
     def _is_covered(name: str, sym: str) -> bool:
@@ -559,7 +619,8 @@ def _select_uncovered_cn_hk_movers(
     else:
         for sec in cn_pool_sectors.get("gainers", []) + cn_pool_sectors.get("losers", []):
             for st in sec.get("stocks", []):
-                if abs(st.get("pct", 0.0)) >= 3.0:
+                # A股提高阈值至 >=4.0%，避免普跌/普涨日大量随波逐流的纯A股占满 Exa 额度
+                if abs(st.get("pct", 0.0)) >= 4.0:
                     _add("cn", st["code"], st["name"], st["pct"], f"A股·{sec['name']}")
         for sec in hk_pool_sectors.get("gainers", []) + hk_pool_sectors.get("losers", []):
             for st in sec.get("stocks", []):
@@ -585,11 +646,16 @@ def _select_uncovered_cn_hk_movers(
             rest = [r[2] for r in hk_rows[4:] + cn_rows[max(2, max_total - len(hk_rows[:4])) :]]
             picked.extend(rest[: max_total - len(picked)])
     else:
-        # 午盘/收盘：A 股最多 3 只 + 港股最多 3 只，单边不足则由另一边递补
-        picked.extend(r[2] for r in cn_rows[:3])
-        picked.extend(r[2] for r in hk_rows[:3])
+        # 午盘/收盘：名额向港股/中概倾斜（港股最多 4 只 + A股最多 2 只），单边不足则由另一边递补
+        picked.extend(r[2] for r in hk_rows[:4])
+        cn_cap = max(2, max_total - len(picked))
+        picked.extend(r[2] for r in cn_rows[:cn_cap])
         if len(picked) < max_total:
-            extras = sorted(cn_rows[3:] + hk_rows[3:], key=lambda x: -x[1])
+            used = {x["symbol"] for x in picked}
+            extras = sorted(
+                [r for r in hk_rows[4:] + cn_rows[cn_cap:] if r[2]["symbol"] not in used],
+                key=lambda x: -x[1],
+            )
             picked.extend(r[2] for r in extras[: max_total - len(picked)])
 
     return picked[:max_total]
@@ -806,7 +872,7 @@ def run_fetch(session_mode: str) -> int:
         for c, fut in futs.items():
             ma_map[c] = fut.result()
 
-    telegraph = fetch_sina_telegraph(limit=30)
+    telegraph = fetch_sina_telegraph(limit=38)
 
     exa_catalyst_block = ""
     exa_macro_lines: list[str] = []
